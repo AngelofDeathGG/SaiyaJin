@@ -1,4 +1,4 @@
-"""Mini plataformero con tkinter (sin dependencias). Controles: <-/-> o A/D moverse, Z sprint, Espacio/W/Arriba saltar, R reiniciar."""
+"""Mini plataformero con tkinter (sin dependencias). Controles: <-/-> o A/D moverse, X punetazo, C capturar altar, Z sprint, Espacio/W/Arriba saltar, R reiniciar."""
 import tkinter as tk
 
 W, H = 800, 600
@@ -8,6 +8,10 @@ GRAV, SPEED, JUMP = 1.0, 5.5, -14.5
 GRAV_L1, JUMP_L1 = 1.35, -16.8
 SPRINT_SPEED = 8.5  # con Z
 COYOTE_TICKS, BUFFER_TICKS = 8, 8
+MAX_LIVES = 5  # game over tras 5 muertes
+PUNCH_TICKS, PUNCH_CD = 16, 8  # punetazo frenetico con X: dura 16 y recarga 8
+DEATH_TICKS = 55  # animacion de muerte estilo Mario NES: saltito y caida rapida
+DEATH_HOP = -12.0
 ICE = {6, 8}  # indices en PLATFORMS con hielo (p4 y p6): resbalan
 BOMB_GRAV = 0.35
 # Monstruos del nivel 2 (quietos en su plataforma, lanzan bombas parabolicas al jugador)
@@ -21,7 +25,7 @@ MONSTERS_L2 = [
         "cd": 190, "dir": -1},  # p6: tira a la izquierda
 ]
 
-# Nivel 3: boss piramide iluminati + templos capturables con X
+# Nivel 3: boss piramide iluminati + templos capturables con C
 # Templos apoyados sobre suelo/plataformas (x, y, w, h). y = superficie - h.
 TEMPLES_L3 = [
     {"x": 60, "y": 560 - 70, "w": 70, "h": 70},    # templo 1: suelo izq
@@ -86,7 +90,7 @@ class Logic:
         self.saiyan = False
         self.tick = 0
         self.score = 0
-        self.lives = 3
+        self.lives = MAX_LIVES
         self.levelbanner = 120  # muestra NIVEL 1 al inicio
         self.transforming = 0
         self.transform_target = 2
@@ -97,9 +101,48 @@ class Logic:
         self._setup_level()
 
     def restart_level(self):
-        self.lives = 3
+        # Reinicio total (game over / jugar otra vez): se empieza desde el
+        # nivel 1, con vidas llenas y todo coleccionable de vuelta
+        # (cofres, esferas y score).
+        self.level = 1
+        self.saiyan = False
+        self.transform_target = 2
+        self.levelbanner = 120  # muestra NIVEL 1 al empezar
+        self.lives = MAX_LIVES
         self.transforming = 0
+        self.score = 0
+        self.balls_taken = [False, False, False]
+        self.ball_msg = 0
+        self.wish = ""
+        self.wish_done = False
         self._setup_level()
+
+    def soft_respawn(self):
+        """Reaparicion con R en plena partida: conserva cofres, esferas,
+        score, vidas y templos; solo recoloca al jugador y limpia peligros."""
+        self.px, self.py = self.spawn
+        self.vx, self.vy = 0, 0
+        self.on_ground = False
+        self.on_mover = False
+        self.on_ice = False
+        self.coyote = 0
+        self.jbuf = 0
+        self.dying = 0
+        self.dying_vy = 0.0
+        self.punch_t = 0
+        self.punch_cd = 0
+        self._prev_punch = False
+        self._prev_cap = False
+        self._cap_armed = False
+        self.capturing = False
+        self.invuln = 90  # ~1.5s de gracia
+        self.hurt = 0
+        self.bombs = []
+        self.booms = []
+        if self.level == 3:
+            self.beams = []
+            if self.boss is not None:
+                self.boss["t"] = BEAM_CD
 
     def _setup_level(self):
         self.px, self.py, self.vx, self.vy = 40, 480, 0, 0
@@ -113,12 +156,19 @@ class Logic:
                          for i, m in enumerate(MONSTERS_L2)] if self.level == 2 else []
         self.bombs = []
         self.booms = []
+        self.pops = []  # monedas saltando estilo Mario al romper cofres
         self.invuln = 0
         self.hurt = 0  # frames de flash rojo al recibir dano
         self.on_mover = False
         self.on_ice = False
         self.coyote = 0
         self.jbuf = 0
+        self.dying = 0  # animacion de muerte estilo Mario NES (>0 = muriendo)
+        self.dying_vy = 0.0
+        self.punch_t = 0  # frames restantes del punetazo
+        self.punch_cd = 0  # recarga del punetazo
+        self.facing = 1  # 1 derecha, -1 izquierda
+        self._prev_punch = False
         if not hasattr(self, "transforming"):
             self.transforming = 0
         if not hasattr(self, "transform_target"):
@@ -127,12 +177,16 @@ class Logic:
             self.balls_taken = [False, False, False]
         if not hasattr(self, "ball_msg"):
             self.ball_msg = 0
-        # Esfera del nivel actual (si aun no se agarro la de este nivel)
+        # Estatua de piedra de la esfera del nivel (si aun no se agarro):
+        # la esfera solo sale tras 10 punetazos rapidos.
         if 1 <= self.level <= 3 and not self.balls_taken[self.level - 1]:
             bx, by = DRAGON_BALL_POS[self.level]
-            self.ball = {"x": float(bx), "y": float(
-                by), "stars": self.level, "taken": False}
+            self.statue = {"x": float(bx), "y": float(by),
+                           "stars": self.level, "hits": 0,
+                           "last": -9999, "shake": 0, "broken": False}
+            self.ball = None
         else:
+            self.statue = None
             self.ball = None
         # Nivel 3: boss + templos + rayos (no se resetea transforming aqui para no cortar la cinematica)
         self.temples = [dict(t, prog=0.0, done=False)
@@ -145,17 +199,17 @@ class Logic:
         self.boss_explode = 0
         # hay captura activa este tick (para dibujar barra)
         self.capturing = False
-        # Anti-trampa X: hay que PULSAR X dentro del altar (no vale venir con X ya held).
+        # Anti-trampa C: hay que PULSAR C dentro del altar (no vale venir con C ya held).
         self._prev_cap = False
         self._cap_armed = False
         self.won = False
         self.dead = False
 
     def grav(self):
-        return GRAV_L1 if self.level == 1 else GRAV
+        return GRAV_L1  # misma gravedad en los 3 niveles
 
     def jump_v(self):
-        return JUMP_L1 if self.level == 1 else JUMP
+        return JUMP_L1  # mismo salto en los 3 niveles
 
     def mover_x(self):
         return MOVER["x"]
@@ -171,7 +225,7 @@ class Logic:
     def platforms(self):
         return PLATFORMS + [(self.mover_x(), self.mover_y(), MOVER["w"], MOVER["h"])]
 
-    def step(self, left, right, jump, sprint=False, capture=False):
+    def step(self, left, right, jump, sprint=False, capture=False, punch=False):
         if self.dead or self.won:
             return
         if self.transforming > 0:  # cinematica saiyajin: congela todo
@@ -182,6 +236,33 @@ class Logic:
                 self.saiyan = True
                 self.levelbanner = 150
                 self._setup_level()
+            return
+        if self.dying > 0:
+            # Muerte estilo Mario NES: saltito hacia arriba y caida libre
+            # atravesando todo, sin control ni colisiones.
+            self.tick += 1
+            if self.hurt > 0:
+                self.hurt -= 1
+            if self.levelbanner > 0:
+                self.levelbanner -= 1
+            self.dying_vy += self.grav()
+            if self.dying_vy > 15:
+                self.dying_vy = 15
+            self.py += self.dying_vy
+            self.dying -= 1
+            if self.punch_cd > 0:
+                self.punch_cd -= 1
+            if self.punch_t > 0:
+                self.punch_t -= 1
+            self._prev_punch = bool(punch)
+            self._prev_cap = bool(capture)
+            if self.dying == 0:
+                if self.lives <= 0:
+                    self.dead = True
+                else:
+                    self.px, self.py = self.spawn
+                    self.vx, self.vy = 0, 0
+                    self.invuln = 90  # ~1.5s de gracia
             return
         self.tick += 1
         if self.levelbanner > 0:
@@ -199,6 +280,11 @@ class Logic:
             if e["x"] < e["min"] or e["x"] > e["max"]:
                 e["dir"] *= -1
                 e["x"] = max(e["min"], min(e["max"], e["x"]))
+        # direccion de mirada (para el punetazo): si ambos o ninguno, conserva la anterior
+        if left and not right:
+            self.facing = -1
+        elif right and not left:
+            self.facing = 1
         # velocidad objetivo (sprint con Z) + friccion segun superficie
         spd = SPRINT_SPEED if sprint else SPEED
         target = (spd if right else 0) - (spd if left else 0)
@@ -221,24 +307,10 @@ class Logic:
             solids += [(m["x"], m["y"], m["w"], m["h"], True)
                        for m in self.monsters]
         foe_touch = False
-        self.px += self.vx
-        self.px = max(0, min(W - self.pw, self.px))
-        for x, y, w, h, foe in solids:
-            if self._overlap(x, y, w, h):
-                if not foe:
-                    # Piso/techo fino no es pared: evita teleports al sprintar
-                    # sobre el ascensor junto a p2/p3 (lo resuelve el aterrizaje vertical).
-                    top_pen = (self.py + self.ph) - y
-                    bot_pen = (y + h) - self.py
-                    if top_pen < 12 or bot_pen < 12:
-                        continue
-                if self.vx > 0:
-                    self.px = x - self.pw
-                elif self.vx < 0:
-                    self.px = x + w
-                self.vx = 0
-                if foe:
-                    foe_touch = True
+        # --- vertical primero (con barrido): solo aterriza si venia de arriba
+        # y solo golpea el techo si venia de abajo. El choque lateral NO
+        # aterriza ni sube al borde: cae recto hacia abajo.
+        py0 = self.py
         self.py += self.vy
         self.on_ground = False
         self.on_mover = False
@@ -248,8 +320,11 @@ class Logic:
             magnet = (i == len(plats) - 1 and self.vy >= 0  # ascensor magnetico:
                       and self.px < x + w and self.px + self.pw > x  # engancha 6px antes
                       and y - 6 <= self.py + self.ph <= y + h)  # y no deja pasar de largo
-            if self._overlap(x, y, w, h) or magnet:
-                if self.vy > 0:
+            ov = self._overlap(x, y, w, h)
+            if foe and ov:
+                foe_touch = True
+            if ov or magnet:
+                if self.vy > 0 and py0 + self.ph <= y + 4:
                     self.py = y - self.ph
                     self.vy = 0
                     self.on_ground = True
@@ -257,13 +332,12 @@ class Logic:
                         self.on_mover = True
                     if i < len(plats) and i in ICE:
                         self.on_ice = True
-                    if foe:
-                        foe_touch = True
-                elif self.vy < 0:
+                elif self.vy < 0 and py0 >= y + h - 6:
                     self.py = y + h
                     self.vy = 0
-                    if foe:
-                        foe_touch = True
+                # si entro por el costado (pies ya bajo el borde / cabeza ya
+                # sobre la base) no se aterriza: lo frena el choque horizontal
+                # y el personaje cae recto, sin resbalar al borde.
         # ascensor: ya pegado arriba con snap; nada mas que hacer aqui
         # salto con coyote-time + buffer: perdona pulsar un poco antes/despues del borde
         if jump:
@@ -280,15 +354,60 @@ class Logic:
             self.on_mover = False
             self.coyote = 0
             self.jbuf = 0
-        # monedas
+        # --- horizontal despues (estricto): chocar una pared frena en seco
+        # (vx=0) y el personaje cae recto, sin subir ni resbalar al borde.
+        self.px += self.vx
+        self.px = max(0, min(W - self.pw, self.px))
+        for x, y, w, h, foe in solids:
+            if self._overlap(x, y, w, h):
+                if foe:
+                    foe_touch = True
+                    # un enemigo que se te vino encima sin que te muevas:
+                    # expulsa por el lado de menor penetracion
+                    if self.vx == 0:
+                        pl = self.px + self.pw - x
+                        pr = x + w - self.px
+                        self.px = x - self.pw if pl < pr else x + w
+                        continue
+                elif self.vx == 0:
+                    # quieto dentro de una plataforma (ej. spawn de test):
+                    # no expulsar; lo resuelve el aterrizaje vertical
+                    continue
+                if self.vx > 0:
+                    self.px = x - self.pw
+                elif self.vx < 0:
+                    self.px = x + w
+                self.vx = 0
+        # punetazo con X (flanco): rompe cofres cercanos en la direccion de mirada
+        pressed_p = bool(punch) and not self._prev_punch
+        if pressed_p and self.punch_cd == 0:
+            self.punch_t = PUNCH_TICKS
+            self.punch_cd = PUNCH_CD
+            self._hit_statue()  # 1 golpe por punetazo a la estatua de piedra
+        if self.punch_cd > 0:
+            self.punch_cd -= 1
+        if self.punch_t > 0:
+            self.punch_t -= 1
+        self._prev_punch = bool(punch)
+        if getattr(self, "statue", None) and self.statue["shake"] > 0:
+            self.statue["shake"] -= 1
+        # cofres: solo se rompen con el punetazo (tocarlos no los recoge)
         cx, cy = self.px + self.pw / 2, self.py + self.ph / 2
-        kept = []
-        for mxx, myy in self.coins:
-            if abs(cx - mxx) < 22 and abs(cy - myy) < 26:
-                self.score += 1
-            else:
-                kept.append([mxx, myy])
-        self.coins = kept
+        if self.punch_t > 0:
+            kept = []
+            for mxx, myy in self.coins:
+                dx, dy = mxx - cx, myy - cy
+                reach = ((self.facing == 1 and -12 < dx < 54) or
+                         (self.facing == -1 and -54 < dx < 12))
+                if abs(dy) < 34 and reach:
+                    self.score += 1
+                    self.booms.append({"x": mxx, "y": myy, "t": 12})
+                    # moneda estilo Mario Bros: solo sube y desaparece (sin caer)
+                    self.pops.append({"x": float(mxx), "y": float(myy),
+                                      "vy": -11.0, "t": 18})
+                else:
+                    kept.append([mxx, myy])
+            self.coins = kept
         # esfera del dragon del nivel (una por nivel)
         if self.ball_msg > 0:
             self.ball_msg -= 1
@@ -311,6 +430,7 @@ class Logic:
             self.hit(respawn=True)
         self._update_monsters()
         self._update_bombs()
+        self._update_pops()
         if self.level == 3:
             self._update_boss()
             self._update_beams()
@@ -363,6 +483,47 @@ class Logic:
                 continue
             alive.append(b)
         self.bombs = alive
+
+    def _hit_statue(self):
+        # Golpea la estatua de piedra: combo rapido (10 golpes seguidos
+        # con menos de ~1.2s entre cada uno) y arroja la esfera.
+        st = getattr(self, "statue", None)
+        if not st or st["broken"]:
+            return
+        cx, cy = self.px + self.pw / 2, self.py + self.ph / 2
+        dx, dy = st["x"] - cx, st["y"] - cy
+        reach = ((self.facing == 1 and -16 < dx < 60) or
+                 (self.facing == -1 and -60 < dx < 16))
+        if not (abs(dy) < 48 and reach):
+            return
+        if self.tick - st["last"] > 75:
+            st["hits"] = 1  # muy lento: el combo se reinicia
+        else:
+            st["hits"] += 1
+        st["last"] = self.tick
+        st["shake"] = 8
+        if st["hits"] >= 10:
+            st["broken"] = True
+            st["shake"] = 0
+            self.ball = {"x": float(st["x"]), "y": float(st["y"] - 40),
+                         "stars": st["stars"], "taken": False}
+            self.booms.append({"x": st["x"], "y": st["y"], "t": 12})
+            self.booms.append({"x": st["x"], "y": st["y"] - 20, "t": 12})
+
+    def _update_pops(self):
+        # Monedas que saltan al romper cofres (estilo Mario Bros): suben y caen.
+        if self.dead:
+            return
+        alive = []
+        for p in getattr(self, "pops", []):
+            p["vy"] += 0.6
+            if p["vy"] > 12:
+                p["vy"] = 12
+            p["y"] += p["vy"]
+            p["t"] -= 1
+            if p["t"] > 0:
+                alive.append(p)
+        self.pops = alive
 
     def _boss_eye(self):
         b = self.boss
@@ -420,7 +581,7 @@ class Logic:
             return (self.px < tp["x"] + tp["w"] and self.px + self.pw > tp["x"] and
                     self.py < tp["y"] + tp["h"] and self.py + self.ph > tp["y"])
         inside_any = any(not tp["done"] and _inside(tp) for tp in self.temples)
-        # Rearme: hay que PULSAR X estando dentro. Venir con X ya held no arma,
+        # Rearme: hay que PULSAR C estando dentro. Venir con C ya held no arma,
         # y soltar X o salir del rango desarma (y descarga la barra).
         if not inside_any:
             self._cap_armed = False
@@ -428,7 +589,7 @@ class Logic:
             self._cap_armed = False
         elif pressed:
             self._cap_armed = True
-        # Busca el templo activo (dentro + manteniendo X + armado). Solo uno a la vez.
+        # Busca el templo activo (dentro + manteniendo C + armado). Solo uno a la vez.
         active = None
         if capture and self._cap_armed:
             for i, tp in enumerate(self.temples):
@@ -471,7 +632,7 @@ class Logic:
     def cheat_shenlong(self):
         """Easter egg SHENLONG (solo nivel 3): otorga las 3 esferas sin
         haberlas agarrado, para que Shen Long aparezca al terminar."""
-        if self.dead or self.won or self.transforming > 0:
+        if self.dead or self.won or self.transforming > 0 or self.dying > 0:
             return False
         if self.level != 3:
             return False
@@ -479,13 +640,14 @@ class Logic:
             return False  # ya las tiene todas
         self.balls_taken = [True, True, True]
         self.ball = None
+        self.statue = None
         self.ball_msg = 120  # cartel "¡ESFERA DEL DRAGÓN!"
         return True
 
     def cheat_skip(self):
         """Easter egg ANWARE: salta al siguiente nivel sin monedas/templos.
         En nivel 3 captura todos los templos y destruye la piramide."""
-        if self.dead or self.won or self.transforming > 0:
+        if self.dead or self.won or self.transforming > 0 or self.dying > 0:
             return False
         if self.level == 1:
             self.transform_target = 2
@@ -507,14 +669,21 @@ class Logic:
         return False
 
     def hit(self, respawn=False):
+        if self.dying > 0 or self.dead or self.won or self.transforming > 0:
+            return
         self.lives -= 1
         self.hurt = 15
-        if self.lives <= 0:
-            self.dead = True
-            return
-        self.px, self.py = self.spawn
-        self.vx, self.vy = 0, 0
-        self.invuln = 90  # ~1.5s de gracia
+        self.vx = 0
+        self.vy = 0
+        self.punch_t = 0
+        if respawn:
+            # Caida al hueco: sigue cayendo sin saltito (ya esta fuera de pantalla)
+            self.dying = DEATH_TICKS
+            self.dying_vy = 8.0
+        else:
+            # Estilo Mario NES: saltito hacia arriba y caida atravesando todo
+            self.dying = DEATH_TICKS
+            self.dying_vy = DEATH_HOP
 
     def _overlap(self, x, y, w, h):
         return (self.px < x + w and self.px + self.pw > x and
@@ -601,10 +770,10 @@ class Game:
 
     def _update_ending(self):
         self.ending_t += 1
-        if self.ending == "orbs" and self.ending_t > 200:
+        if self.ending == "orbs" and self.ending_t > 150:
             self.ending = "shenlong"
             self.ending_t = 0
-        elif self.ending == "shenlong" and self.ending_t > 200:
+        elif self.ending == "shenlong" and self.ending_t > 110:
             self.ending = "wish"
             self.ending_t = 0
             self._show_wish_entry()
@@ -644,7 +813,15 @@ class Game:
             self.root.after(16, self.loop)
             return
         if "r" in k or "R" in k:
-            L.restart_level()
+            if L.dead:
+                L.restart_level()  # game over tras 5 muertes: partida nueva
+            elif L.won or L.transforming > 0:
+                L.restart_level()  # fin de nivel: jugar otra vez
+            else:
+                # en partida: reaparece conservando vidas, cofres y esferas
+                L.soft_respawn()
+            k.discard("r")
+            k.discard("R")
         if L.dead:
             self.draw(
                 f"GAME OVER NIVEL {L.level}  Score {L.score}. Pulsa R", "#f38ba8")
@@ -660,6 +837,7 @@ class Game:
                    "Right" in k or "d" in k or "D" in k,
                    "space" in k or "Up" in k or "w" in k or "W" in k,
                    "z" in k or "Z" in k,
+                   "c" in k or "C" in k,
                    "x" in k or "X" in k)
             k.discard("space")
             hearts = "♥" * L.lives
@@ -667,10 +845,11 @@ class Game:
             if L.level == 3:
                 nd = L.temples_done()
                 self.draw(
-                    f"NIVEL 3 {hearts} Templos {nd}/3 | Esferas {balls} | Mantén X | Z sprint", "#fde047")
+                    f"NIVEL 3 Vidas {hearts} Templos {nd}/3 Esferas {balls} | C altar X golpe Space saltar", "#fde047")
             else:
+                got = len(COINS) - len(L.coins)
                 self.draw(
-                    f"NIVEL {L.level} {hearts} Monedas {L.score}/{len(COINS)} Esferas {balls} | Z sprint. R reinicia", "#cdd6f4")
+                    f"NIVEL {L.level} Vidas {hearts} Monedas {got}/{len(COINS)} Esferas {balls} | X golpe Space saltar Z sprint R", "#cdd6f4")
         self.root.after(16, self.loop)
 
     def draw(self, msg, fg):
@@ -678,16 +857,22 @@ class Game:
         t = L.tick
         c.delete("all")
         self._bg(c, t, level=L.level)
-        # liquido en huecos del suelo: lava en nivel 2, agua en el resto
+        # liquido en huecos del suelo: toxica en nivel 2, agua en el resto
         if L.level == 2:
+            # agua verde toxica con burbujas
             for x0 in (220, 490):
                 c.create_rectangle(x0, 578, x0 + 70, 600,
-                                   fill="#ff5a3c", outline="")
+                                   fill="#3f6212", outline="")
                 c.create_rectangle(x0, 578, x0 + 70, 584,
-                                   fill="#ffb35c", outline="")
+                                   fill="#84cc16", outline="")
                 for i in range(3):
                     bx = x0 + 12 + i * 22 + ((t // 3 + i * 7) % 5) - 2
-                    c.create_oval(bx, 586, bx + 8, 592, fill="#ffd166", outline="")
+                    c.create_oval(bx, 586, bx + 8, 592, fill="#d9f99d", outline="")
+                for j in range(2):  # burbujas subiendo
+                    by = 598 - ((t * 2 + x0 + j * 29) % 18)
+                    bx2 = x0 + 10 + j * 30 + ((t + j * 5) % 3)
+                    c.create_oval(bx2, by - 3, bx2 + 5, by + 2,
+                                  fill="#ecfccb", outline="")
         else:
             for x0 in (220, 490):
                 c.create_rectangle(x0, 578, x0 + 70, 600,
@@ -729,17 +914,35 @@ class Game:
             wave = ((t // 5) % 4) - 2
             c.create_polygon(578, 30, 620, 38 + wave, 578, 48,
                              fill="#ef4444", outline="#991b1b")
-        # monedas girando con brillo
-        for i, (mxx, myy) in enumerate(L.coins):
-            c.create_oval(mxx - 12, myy - 12, mxx + 12, myy +
-                          12, fill="#fbbf24", outline="")
-            import math
-            rx = 3 + 6 * abs(math.cos((t + i * 9) / 12))
-            c.create_oval(mxx - rx, myy - 9, mxx + rx, myy +
-                          9, fill="#fde68a", outline="#b45309")
+        # monedas que saltan al romper cofres (la misma de antes, estilo Mario)
+        import math as _m
+        for i, p in enumerate(getattr(L, "pops", [])):
+            mxx, myy = p["x"], p["y"]
+            c.create_oval(mxx - 12, myy - 12, mxx + 12, myy + 12,
+                          fill="#fbbf24", outline="")
+            rx = 3 + 6 * abs(_m.cos((t + i * 9) / 12))
+            c.create_oval(mxx - rx, myy - 9, mxx + rx, myy + 9,
+                          fill="#fde68a", outline="#b45309")
             c.create_text(mxx, myy, text="$", fill="#92400e",
                           font=("Arial", 9, "bold"))
-        # esfera del dragon del nivel (si aun no se agarro): solo el icono flotando
+        # cofres de madera (se rompen con punetazo X)
+        for i, (mxx, myy) in enumerate(L.coins):
+            c.create_oval(mxx - 14, myy + 8, mxx + 14, myy + 14,
+                          fill="#000000", outline="", stipple="gray50")
+            c.create_rectangle(mxx - 15, myy - 12, mxx + 15, myy + 12,
+                               fill="#92400e", outline="#451a03", width=2)
+            c.create_rectangle(mxx - 15, myy - 12, mxx + 15, myy - 2,
+                               fill="#b45309", outline="#451a03")
+            c.create_rectangle(mxx - 3, myy - 12, mxx + 3, myy + 12,
+                               fill="#fbbf24", outline="#451a03")
+            c.create_rectangle(mxx - 5, myy - 1, mxx + 5, myy + 7,
+                               fill="#fde68a", outline="#451a03")
+            c.create_oval(mxx - 2, myy + 1, mxx + 2, myy + 5,
+                          fill="#451a03", outline="")
+        # estatua de piedra de la esfera del nivel (10 punetazos la rompen)
+        if getattr(L, "statue", None):
+            self._statue(c, L.statue, t)
+        # esfera del dragon del nivel (sale de la estatua rota): solo el icono flotando
         if getattr(L, "ball", None):
             self._dragon_ball(
                 c, L.ball["x"], L.ball["y"], L.ball["stars"], t, r=13)
@@ -771,8 +974,10 @@ class Game:
                 self._boss(c, L, t)
             for bm in getattr(L, "beams", []):
                 self._beam(c, bm, t)
-        # jugador (parpadea si invulnerable)
-        if L.invuln == 0 or (t // 4) % 2 == 0:
+        # jugador (muerte NES con pose propia; parpadea si invulnerable)
+        if L.dying > 0:
+            self._player_dead(c, L, t)
+        elif L.invuln == 0 or (t // 4) % 2 == 0:
             self._player(c, L, t)
         # HUD con panel
         c.create_rectangle(8, 6, W - 8, 32, fill="#000000",
@@ -800,9 +1005,9 @@ class Game:
             if L.level == 2:
                 sub = "¡Esquiva las bombas parabolicas!"
             elif L.level == 3:
-                sub = "¡Captura los 3 templos con X y destruye la pirámide!"
+                sub = "¡Captura los 3 templos con C y destruye la pirámide!"
             else:
-                sub = "Recoge todo y llega a la META"
+                sub = "Rompe los cofres con X y llega a la bandera"
             c.create_text(W // 2 + 2, H // 2 + 21, text=sub,
                           fill="#000000", font=("Arial", 14, "bold"))
             c.create_text(W // 2, H // 2 + 20, text=sub,
@@ -812,6 +1017,13 @@ class Game:
                           fill="#000000", font=("Arial", 22, "bold"))
             c.create_text(W // 2, H // 2 - 60, text="¡ESFERA DEL DRAGÓN!",
                           fill="#fb923c", font=("Arial", 22, "bold"))
+        if L.dead:  # game over grande al centro, en rojo
+            c.create_text(W // 2 + 3, H // 2 - 17, text="GAME OVER",
+                          fill="#000000", font=("Arial", 48, "bold"))
+            c.create_text(W // 2, H // 2 - 20, text="GAME OVER",
+                          fill="#ef4444", font=("Arial", 48, "bold"))
+            c.create_text(W // 2, H // 2 + 22, text="Pulsa R para intentarlo otra vez",
+                          fill="#fca5a5", font=("Arial", 14, "bold"))
 
     def _bg(self, c, t, level=1, day=None):
         if day is None:
@@ -842,7 +1054,33 @@ class Game:
             c.create_polygon(100, 420, 120, 400, 140, 420,
                              fill="#f8fafc", outline="")
             return
-        top, bot = (11, 16, 38), (46, 32, 86)  # nivel 2: noche
+        if level == 2:  # nivel 2: tarde / atardecer
+            top, bot = (88, 38, 110), (248, 146, 72)
+            steps = 20
+            for i in range(steps):
+                r = top[0] + (bot[0] - top[0]) * i // steps
+                g = top[1] + (bot[1] - top[1]) * i // steps
+                b = top[2] + (bot[2] - top[2]) * i // steps
+                c.create_rectangle(0, i * H // steps, W, (i + 1) * H // steps + 1,
+                                   fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
+            c.create_oval(630, 350, 750, 470, fill="#fdba74",
+                          outline="")  # halo sol bajo
+            c.create_oval(655, 375, 725, 445, fill="#fb923c", outline="")
+            for cx in (140 + (t // 3) % 900 - 50, 500 + (t // 4) % 900 - 50):
+                cy = 120 + (cx % 70)
+                for ox, oy, s in ((0, 0, 26), (24, 6, 20), (-24, 8, 18), (8, -10, 16)):
+                    c.create_oval(cx + ox - s, cy + oy - s // 2, cx + ox + s, cy + oy + s // 2,
+                                  fill="#f2a56b", outline="")
+            c.create_polygon(0, 560, 120, 420, 260, 560,
+                             fill="#3a2340", outline="")
+            c.create_polygon(220, 560, 400, 440, 580, 560,
+                             fill="#46284a", outline="")
+            c.create_polygon(540, 560, 680, 430, 800, 560,
+                             fill="#3a2340", outline="")
+            c.create_polygon(100, 420, 120, 400, 140, 420,
+                             fill="#78716c", outline="")  # pico grisaceo
+            return
+        top, bot = (11, 16, 38), (46, 32, 86)  # nivel 3: noche
         steps = 20
         for i in range(steps):
             r = top[0] + (bot[0] - top[0]) * i // steps
@@ -871,14 +1109,14 @@ class Game:
         c.create_polygon(540, 560, 680, 430, 800, 560,
                          fill="#1e1b4b", outline="")
         c.create_polygon(100, 420, 120, 400, 140, 420,
-                         fill="#f8fafc", outline="")
+                         fill="#6b7280", outline="")  # pico grisaceo (no blanco)
         if level == 3:  # tormenta dorada / templo: ambiente rojizo ominoso
             c.create_oval(90, 60, 170, 140, fill="#7f1d1d", outline="")
             c.create_oval(105, 75, 155, 125, fill="#ef4444", outline="")
             for i in range(6):
                 lx = (i * 173 + t * 4) % W
                 c.create_line(lx, 0, lx - 30, 90, fill="#facc15", width=1)
-        # NOTE: nivel 2 comparte base nocturna; el extra de nivel 3 va arriba
+        # NOTE: base nocturna solo del nivel 3; su extra va arriba
 
     def _platform(self, c, x, y, w, h, ice=False):
         ground = h > 25
@@ -980,13 +1218,11 @@ class Game:
                           fill="#22c55e", outline="#bbf7d0", width=2)
             c.create_text(x + w // 2, y + 34, text="✔", fill="white",
                           font=("Arial", 11, "bold"))
-            c.create_text(x + w // 2, y - 24, text="CAPTURADO", fill="#4ade80",
-                          font=("Arial", 9, "bold"))
         else:
             pulse = ((t // 8) % 2 == 0)
             c.create_oval(x + w // 2 - 10, y + 24, x + w // 2 + 10, y + 44,
                           fill="#1c1917" if not pulse else "#292524", outline="#facc15", width=2)
-            c.create_text(x + w // 2, y + 34, text="X", fill="#facc15",
+            c.create_text(x + w // 2, y + 34, text="C", fill="#facc15",
                           font=("Arial", 11, "bold"))
             # barra de progreso
             bw = w - 10
@@ -994,8 +1230,6 @@ class Game:
                                fill="#000000", outline="#facc15")
             c.create_rectangle(x + 5, base - 12, x + 5 + bw * tp["prog"], base - 4,
                                fill="#facc15", outline="")
-            c.create_text(x + w // 2, y - 24, text="MANTÉN X", fill="#fef3c7",
-                          font=("Arial", 9, "bold"))
 
     def _boss(self, c, L, t):
         b = L.boss
@@ -1070,6 +1304,52 @@ class Game:
         c.create_oval(x - r - tw, y - r - tw, x + r + tw, y + r + tw,
                       fill="", outline="#fde68a", width=1)
 
+    def _statue(self, c, st, t):
+        # Estatua de piedra de la esfera: pedestal + columna + esfera de
+        # piedra con estrellas talladas. Se agrieta con los golpes y al
+        # romperse solo queda la base en ruinas.
+        x, y = st["x"], st["y"]
+        if st["shake"] > 0 and not st["broken"]:
+            x += 2 if (t // 2) % 2 == 0 else -2
+        GY = 560  # las 3 estatuas estan sobre suelo (top 560)
+        c.create_oval(x - 30, GY - 2, x + 30, GY + 6,
+                      fill="#000000", outline="", stipple="gray50")
+        # pie + columna de piedra
+        c.create_rectangle(x - 28, GY - 16, x + 28, GY,
+                           fill="#78716c", outline="#44403c", width=2)
+        c.create_rectangle(x - 30, GY - 22, x + 30, GY - 16,
+                           fill="#a8a29e", outline="#57534e", width=2)
+        c.create_rectangle(x - 11, y + 16, x + 11, GY - 22,
+                           fill="#8a8580", outline="#57534e", width=2)
+        c.create_line(x - 7, y + 18, x - 7, GY - 24, fill="#a8a29e", width=2)
+        # capitel bajo la esfera
+        c.create_rectangle(x - 20, y + 10, x + 20, y + 16,
+                           fill="#a8a29e", outline="#57534e", width=2)
+        if st["broken"]:
+            for rx, ry, s in ((-12, 2, 6), (8, 0, 8), (0, 7, 5)):
+                c.create_polygon(x + rx, y + ry, x + rx + s, y + ry + 2,
+                                 x + rx + 2, y + ry - s,
+                                 fill="#a8a29e", outline="#57534e")
+            return
+        # esfera de piedra con estrellas talladas
+        r = 16
+        c.create_oval(x - r, y - r, x + r, y + r,
+                      fill="#a8a29e", outline="#57534e", width=2)
+        c.create_oval(x - r + 3, y - r + 2, x - r + 9, y - r + 8,
+                      fill="#d6d3d1", outline="")
+        import math
+        for i in range(max(1, min(7, st["stars"]))):
+            ang = -math.pi / 2 + i * (2 * math.pi / max(1, min(7, st["stars"])))
+            sx = x + math.cos(ang) * (r * 0.45)
+            sy = y + math.sin(ang) * (r * 0.45)
+            c.create_polygon(sx, sy - 4, sx + 3.5, sy + 2.5, sx - 3.5, sy + 2.5,
+                             fill="#57534e", outline="")
+        # grietas: mas golpes = mas grietas
+        for i in range(st["hits"] * 6 // 10):
+            lx = x - 12 + i * 5
+            c.create_line(lx, y - 14, lx + 3, y - 6, lx - 2, y + 2,
+                          fill="#44403c", width=2)
+
     def draw_ending(self):
         c, L = self.cv, self.logic
         t = self.ending_t
@@ -1126,10 +1406,10 @@ class Game:
                 c.create_text(cx, 445, text="Escribe tu deseo y pulsa Enter",
                               fill="#fef3c7", font=("Arial", 12, "bold"))
             else:
-                c.create_text(cx, 110, text="Tu deseo se cumplirá, gracias",
+                c.create_text(cx, 110, text="Tu deseo se cumplirá, nos vemos!",
                               fill="#a6e3a1", font=("Arial", 18, "bold"))
         elif self.ending == "scatter":
-            c.create_text(cx, 120, text="Tu deseo se cumplirá, gracias",
+            c.create_text(cx, 120, text="Tu deseo se cumplirá, nos vemos!",
                           fill="#a6e3a1", font=("Arial", 16, "bold"))
             c.create_text(cx, 150, text="¡Las esferas se dispersan por el mundo!",
                           fill="#fde047", font=("Arial", 12, "bold"))
@@ -1140,7 +1420,7 @@ class Game:
         elif self.ending == "fin":
             c.create_text(cx, 220, text="— FIN —",
                           fill="#f8fafc", font=("Arial", 44, "bold"))
-            c.create_text(cx, 270, text="Tu deseo se cumplirá, gracias 🐉",
+            c.create_text(cx, 270, text="Tu deseo se cumplirá, nos vemos! 🐉",
                           fill="#a6e3a1", font=("Arial", 15, "bold"))
             c.create_text(cx, 340, text=f"Esferas ●●●  Score {L.score}",
                           fill="#fbbf24", font=("Arial", 12, "bold"))
@@ -1169,14 +1449,11 @@ class Game:
             x1, y1 = pts[i + 1]
             c.create_line(x0, y0 - 4, x1, y1 - 4, fill="#22c55e", width=16)
             c.create_line(x0, y0 + 8, x1, y1 + 8, fill="#bbf7d0", width=4)
-        # garras
-        for gx in (cx - 120, cx + 40, cx + 180):
-            gy = cy + 30
-            for dx in (-10, 0, 10):
-                c.create_line(gx, gy, gx + dx, gy + 18,
-                              fill="#fef3c7", width=3)
-        # cabeza
-        hx, hy = cx + 230, cy - 60 + math.sin(t / 15) * 6
+        # cabeza unida a la punta del cuerpo (misma fase: se mueven juntos)
+        ex, ey = pts[-1]
+        hx, hy = ex - 10, ey - 35
+        c.create_line(ex - 25, ey - 5, hx - 25, hy + 15,
+                      fill="#16a34a", width=22)  # cuello: sin huecos
         c.create_oval(hx - 55, hy - 30, hx + 35, hy + 30,
                       fill="#16a34a", outline="#14532d", width=3)
         c.create_polygon(hx - 55, hy - 10, hx - 90, hy - 25, hx - 55, hy + 15,
@@ -1204,9 +1481,6 @@ class Game:
         run = (t // 5) % 2 if (L.vx != 0 and L.on_ground) else 0
         air = not L.on_ground
         sprinting = abs(L.vx) > 6.5 and L.on_ground
-        if sprinting:  # aura dorada al correr a full
-            c.create_oval(x - 8, y - 34, x + w + 8, y + h + 4,
-                          fill="#ffeb3b", outline="", stipple="gray25")
         c.create_oval(x - 2, y + h - 6, x + w + 2, y + h,
                       fill="#000000", outline="", stipple="gray50")
         if sprinting:  # lineas de velocidad + polvo
@@ -1231,10 +1505,6 @@ class Game:
                            h - 6, fill="#3b82f6", outline="#1e3a8a")
         c.create_rectangle(x + 1, y + 12, x + w - 1, y +
                            18, fill="#60a5fa", outline="")
-        if L.vx != 0:  # capa al viento
-            d = 1 if L.vx > 0 else -1
-            c.create_polygon(x + w // 2, y + 16, x + w // 2 - d * 16, y + 24 + run * 2, x + w // 2, y + 30,
-                             fill="#ef4444", outline="#991b1b")
         if L.saiyan:
             if L.level == 3:
                 # SSJ3: cabellera larga amarilla hasta la cintura + cejas marcadas
@@ -1283,9 +1553,66 @@ class Game:
                       2, y + 13, fill="#111111", outline="")
         c.create_oval(ex + 3 + d // 2, y + 10, ex + 6 + d //
                       2, y + 13, fill="#111111", outline="")
-        if air and L.vy < -4:  # estela al saltar
-            c.create_oval(x + 4, y + h + 2, x + w - 4, y +
-                          h + 8, fill="#bfdbfe", outline="")
+        if L.punch_t > 0:  # punetazo con X: manga del gi + antebrazo + puno con nudillos
+            import math
+            d = L.facing if L.facing != 0 else 1
+            sy = y + 22
+            phase = 1.0 - L.punch_t / PUNCH_TICKS  # 0 -> 1 (sale y vuelve)
+            reach = 12 + 9 * math.sin(math.pi * min(1.0, max(0.0, phase)))
+            sx = x + w - 2 if d > 0 else x + 2
+            fx = sx + d * reach
+            # manga del gi (azul con sombra)
+            mx0, mx1 = (sx, sx + d * 9) if d > 0 else (sx + d * 9, sx)
+            c.create_rectangle(min(mx0, mx1), sy - 6, max(mx0, mx1), sy + 6,
+                               fill="#1d4ed8", outline="#1e3a8a", width=2)
+            c.create_rectangle(min(mx0, mx1), sy + 2, max(mx0, mx1), sy + 6,
+                               fill="#3b82f6", outline="")
+            # antebrazo de piel con sombreado
+            ax0, ax1 = (mx1, fx) if d > 0 else (fx, mx1)
+            c.create_rectangle(min(ax0, ax1), sy - 4, max(ax0, ax1), sy + 4,
+                               fill="#ffcf9e", outline="#92400e", width=2)
+            c.create_line(min(ax0, ax1), sy + 2, max(ax0, ax1), sy + 2,
+                          fill="#e8a06c", width=1)
+            # puno: base + brillo + nudillos + pulgar
+            r = 8
+            c.create_oval(fx - r, sy - r, fx + r, sy + r,
+                          fill="#ffcf9e", outline="#7c2d12", width=2)
+            c.create_oval(fx - r + 2, sy - r + 1, fx - r + 6, sy - r + 5,
+                          fill="#ffe7c7", outline="")
+            for oy in (-4, 0, 4):
+                kx = fx + d * (r - 3)
+                c.create_oval(kx - 2, sy + oy - 2, kx + 2, sy + oy + 2,
+                              fill="#f4a261", outline="#7c2d12")
+            # lineas de impacto
+            for i in range(2):
+                lx = fx + d * (r + 4 + i * 5)
+                c.create_line(lx, sy - 6 + i * 12, lx + d * 6, sy - 6 + i * 12,
+                              fill="#fef3c7", width=2)
+
+
+    def _player_dead(self, c, L, t):
+        # Pose de derrota estilo Mario NES: brazos arriba, ojos en X, cayendo.
+        x, y, w, h = L.px, L.py, L.pw, L.ph
+        c.create_oval(x - 2, y + h - 6, x + w + 2, y + h,
+                      fill="#000000", outline="", stipple="gray50")
+        c.create_rectangle(x + 1, y + 12, x + w - 1, y + h - 6,
+                           fill="#3b82f6", outline="#1e3a8a")
+        c.create_rectangle(x - 6, y - 6, x + 1, y + 14,
+                           fill="#ffcf9e", outline="#92400e")
+        c.create_rectangle(x + w - 1, y - 6, x + w + 6, y + 14,
+                           fill="#ffcf9e", outline="#92400e")
+        c.create_rectangle(x + 4, y + h - 8, x + 10, y + h,
+                           fill="#1d4ed8", outline="#1e3a8a")
+        c.create_rectangle(x + w - 10, y + h - 8, x + w - 4, y + h,
+                           fill="#1d4ed8", outline="#1e3a8a")
+        c.create_oval(x - 1, y - 4, x + w + 1, y + 18,
+                      fill="#ffcf9e", outline="#92400e")
+        ex = x + w // 2
+        for ox in (-6, 1):
+            c.create_line(ex + ox, y + 8, ex + ox + 6, y + 14,
+                          fill="#111111", width=2)
+            c.create_line(ex + ox + 6, y + 8, ex + ox, y + 14,
+                          fill="#111111", width=2)
 
 
 def selftest():
@@ -1297,11 +1624,18 @@ def selftest():
     assert L.on_ground, "colision suelo falla"
     L.step(False, False, True)
     assert L.vy == L.jump_v(), "salto falla"
+    # tocar el cofre NO lo recoge
     n = len(L.coins)
     L.px, L.py = COINS[0][0] - 13, COINS[0][1] - 18
     L.vy = 0
     L.step(False, False, False)
-    assert len(L.coins) == n - 1, "moneda no se recoge"
+    assert len(L.coins) == n, "cofre se rompio sin punetazo"
+    # punetazo con X mirando a la derecha lo rompe
+    L.px, L.py = COINS[0][0] - 40, COINS[0][1] - 18
+    L.vy = 0
+    L.step(False, True, False, punch=True)
+    assert len(L.coins) == n - 1, "cofre no se rompe con X"
+    assert L.punch_t > 0, "sin animacion de punetazo"
     # pincho quita vida
     L2 = Logic()
     L2.px, L2.py = SPIKES[0][0], SPIKES[0][1] - 10
@@ -1314,7 +1648,7 @@ def selftest():
     e = L3.enemies[0]
     L3.px, L3.py = e["x"], e["y"]
     L3.step(False, False, False)
-    assert L3.lives == 2, "enemigo no dana"
+    assert L3.lives == MAX_LIVES - 1, "enemigo no dana"
     assert L3.hurt > 0, "sin flash de dano"
     # ascensor: existe, se mueve en vertical y no solapa plataformas
     L.tick = 0
@@ -1409,10 +1743,15 @@ def selftest():
     L9.px, L9.py, L9.vy = 80, 470 - L9.ph, 0
     for _ in range(30):
         L9.step(False, True, False)
-        if L9.lives < 3:
+        if L9.lives < MAX_LIVES:
             break
-    assert L9.lives == 2 and (
-        L9.px, L9.py) == L9.spawn, "monstruo atravesable o no dana"
+    assert L9.lives == MAX_LIVES - 1 and L9.dying > 0, "monstruo atravesable o no dana"
+    for _ in range(DEATH_TICKS + 5):  # muerte NES termina reapareciendo en spawn
+        L9.step(False, False, False)
+        if L9.dying == 0:
+            break
+    assert L9.dying == 0 and L9.lives == MAX_LIVES - 1, "muerte NES no reaparece"
+    assert L9.px == L9.spawn[0] and L9.py >= L9.spawn[1], "muerte NES no vuelve al spawn"
     # nivel 2: ganar lleva al nivel 3 (no victoria aun)
     L7.coins = []
     L7.px, L7.py = 500, 40
@@ -1442,7 +1781,7 @@ def selftest():
     v = Lb.lives
     Lb.step(False, False, False)
     assert Lb.lives == v - 1 and Lb.beams == [], "bola no dana/mata"
-    # templos: mantener X captura, al capturar los 3 la piramide explota y ganas
+    # templos: mantener C captura, al capturar los 3 la piramide explota y ganas
     Lc = Logic()
     Lc.level = 3
     Lc._setup_level()
@@ -1456,8 +1795,8 @@ def selftest():
         Lc.boss["t"] = 9999
         Lc.beams = []
         Lc.step(False, False, False, capture=True)
-    assert tp["done"], "templo no se captura con X"
-    # sin X no hay progreso
+    assert tp["done"], "templo no se captura con C"
+    # sin C no hay progreso
     Ld = Logic()
     Ld.level = 3
     Ld._setup_level()
@@ -1469,7 +1808,7 @@ def selftest():
         Ld.boss["t"] = 9999
         Ld.beams = []
         Ld.step(False, False, False, capture=False)
-    assert tp0["prog"] == 0.0 and not tp0["done"], "templo captura sin X"
+    assert tp0["prog"] == 0.0 and not tp0["done"], "templo captura sin C"
     for t2 in Lc.temples:
         t2["prog"] = 1.0
         t2["done"] = True
@@ -1508,9 +1847,32 @@ def selftest():
     for _ in range(120):
         La.step(False, False, False)
     assert La.won, "ANWARE nivel 3 no gana"
-    # esferas del dragon: una por nivel, se recogen al tocarlas
+    # esferas del dragon: estatua de piedra que arroja la esfera con 10 punetazos
+    def _romper_estatua(L):
+        sx = L.statue["x"]
+        for _ in range(10):
+            L.px, L.py = sx - 40, 560 - L.ph
+            L.vy = 0
+            L.step(False, True, False, punch=True)
+            for _ in range(30):
+                L.step(False, False, False)
+    Lz = Logic()  # golpes lentos reinician el combo
+    assert Lz.statue is not None and Lz.ball is None, "falta estatua nivel 1"
+    _sx = Lz.statue["x"]
+    Lz.px, Lz.py = _sx - 40, 560 - Lz.ph
+    Lz.vy = 0
+    Lz.step(False, True, False, punch=True)
+    assert Lz.statue["hits"] == 1 and Lz.ball is None, "estatua cuenta mal"
+    for _ in range(80):
+        Lz.step(False, False, False)
+    Lz.px, Lz.py = _sx - 40, 560 - Lz.ph
+    Lz.vy = 0
+    Lz.step(False, True, False, punch=True)
+    assert Lz.statue["hits"] == 1 and Lz.ball is None, "combo lento no se reinicia"
     Ls = Logic()
-    assert Ls.ball is not None and Ls.ball["stars"] == 1, "falta esfera nivel 1"
+    assert Ls.statue is not None and Ls.statue["stars"] == 1, "falta estatua nivel 1"
+    _romper_estatua(Ls)
+    assert Ls.statue["broken"] and Ls.ball is not None, "estatua no arroja esfera"
     Ls.px, Ls.py = Ls.ball["x"] - 13, Ls.ball["y"] - 18
     Ls.vy = 0
     Ls.step(False, False, False)
@@ -1522,7 +1884,9 @@ def selftest():
     Ls.step(False, False, False)
     for _ in range(150):
         Ls.step(False, False, False)
-    assert Ls.level == 2 and Ls.ball is not None and Ls.ball["stars"] == 2, "falta esfera nivel 2"
+    assert Ls.level == 2 and Ls.statue is not None and Ls.statue["stars"] == 2, "falta estatua nivel 2"
+    _romper_estatua(Ls)
+    assert Ls.ball is not None, "estatua 2 no arroja esfera"
     Ls.px, Ls.py = Ls.ball["x"] - 13, Ls.ball["y"] - 18
     Ls.vy = 0
     Ls.step(False, False, False)
@@ -1534,9 +1898,9 @@ def selftest():
     Lh = Logic()
     Lh.level = 3
     Lh._setup_level()
-    assert Lh.balls_count() == 0 and Lh.ball is not None, "setup esferas nivel 3 invalido"
+    assert Lh.balls_count() == 0 and Lh.statue is not None and Lh.ball is None, "setup esferas nivel 3 invalido"
     assert Lh.cheat_shenlong(), "SHENLONG no activa en nivel 3"
-    assert Lh.balls_count() == 3 and Lh.ball is None, "SHENLONG no otorgo esferas"
+    assert Lh.balls_count() == 3 and Lh.ball is None and Lh.statue is None, "SHENLONG no otorgo esferas"
     assert not Lh.cheat_shenlong(), "SHENLONG repite con todo completo"
     Lo = Logic()  # fuera del nivel 3 no activa
     assert not Lo.cheat_shenlong(), "SHENLONG activo fuera del nivel 3"
