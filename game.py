@@ -4,6 +4,8 @@ import tkinter as tk
 W, H = 800, 600
 # salto ~105px: menos tiempo en aire, ya no se siente lunar
 GRAV, SPEED, JUMP = 1.0, 5.5, -14.5
+# Nivel 1: gravedad mas alta (cae mas rapido, menos flotante) con misma altura ~105px
+GRAV_L1, JUMP_L1 = 1.35, -16.8
 SPRINT_SPEED = 8.5  # con Z
 COYOTE_TICKS, BUFFER_TICKS = 8, 8
 ICE = {6, 8}  # indices en PLATFORMS con hielo (p4 y p6): resbalan
@@ -33,7 +35,7 @@ BEAM_CD = 85        # cada cuantos ticks dispara el boss
 BEAM_SPEED = 4.6    # velocidad de la bola de energia
 BEAM_R = 9
 # Esferas del dragon: una por nivel (posicion fija, estrellas = nivel).
-DRAGON_BALL_POS = {1: (700, 505), 2: (456, 350), 3: (400, 505)}
+DRAGON_BALL_POS = {1: (700, 505), 2: (735, 505), 3: (400, 505)}
 # alternas >=130 vertical para que NO se puedan saltear
 PLATFORMS = [
     (0, 560, 220, 40),       # suelo izq
@@ -143,8 +145,17 @@ class Logic:
         self.boss_explode = 0
         # hay captura activa este tick (para dibujar barra)
         self.capturing = False
+        # Anti-trampa X: hay que PULSAR X dentro del altar (no vale venir con X ya held).
+        self._prev_cap = False
+        self._cap_armed = False
         self.won = False
         self.dead = False
+
+    def grav(self):
+        return GRAV_L1 if self.level == 1 else GRAV
+
+    def jump_v(self):
+        return JUMP_L1 if self.level == 1 else JUMP
 
     def mover_x(self):
         return MOVER["x"]
@@ -198,7 +209,7 @@ class Logic:
             self.vx += (target - self.vx) * 0.35  # aire: control parcial
         else:
             self.vx = target
-        self.vy += GRAV
+        self.vy += self.grav()
         if self.vy > 15:
             self.vy = 15
         plats = self.platforms()
@@ -214,6 +225,13 @@ class Logic:
         self.px = max(0, min(W - self.pw, self.px))
         for x, y, w, h, foe in solids:
             if self._overlap(x, y, w, h):
+                if not foe:
+                    # Piso/techo fino no es pared: evita teleports al sprintar
+                    # sobre el ascensor junto a p2/p3 (lo resuelve el aterrizaje vertical).
+                    top_pen = (self.py + self.ph) - y
+                    bot_pen = (y + h) - self.py
+                    if top_pen < 12 or bot_pen < 12:
+                        continue
                 if self.vx > 0:
                     self.px = x - self.pw
                 elif self.vx < 0:
@@ -257,7 +275,7 @@ class Logic:
         elif self.coyote > 0:
             self.coyote -= 1
         if self.jbuf > 0 and (self.on_ground or self.coyote > 0):
-            self.vy = JUMP
+            self.vy = self.jump_v()
             self.on_ground = False
             self.on_mover = False
             self.coyote = 0
@@ -394,20 +412,46 @@ class Logic:
     def _update_temples(self, capture):
         self.capturing = False
         if self.level != 3 or self.boss_explode > 0:
+            self._prev_cap = bool(capture)
             return
-        for tp in self.temples:
+        pressed = bool(capture) and not self._prev_cap
+        # ¿jugador dentro de algun altar pendiente?
+        def _inside(tp):
+            return (self.px < tp["x"] + tp["w"] and self.px + self.pw > tp["x"] and
+                    self.py < tp["y"] + tp["h"] and self.py + self.ph > tp["y"])
+        inside_any = any(not tp["done"] and _inside(tp) for tp in self.temples)
+        # Rearme: hay que PULSAR X estando dentro. Venir con X ya held no arma,
+        # y soltar X o salir del rango desarma (y descarga la barra).
+        if not inside_any:
+            self._cap_armed = False
+        elif not capture:
+            self._cap_armed = False
+        elif pressed:
+            self._cap_armed = True
+        # Busca el templo activo (dentro + manteniendo X + armado). Solo uno a la vez.
+        active = None
+        if capture and self._cap_armed:
+            for i, tp in enumerate(self.temples):
+                if tp["done"]:
+                    continue
+                if _inside(tp):
+                    active = i
+                    break
+        for i, tp in enumerate(self.temples):
             if tp["done"]:
                 continue
-            inside = (self.px < tp["x"] + tp["w"] and self.px + self.pw > tp["x"] and
-                      self.py < tp["y"] + tp["h"] and self.py + self.ph > tp["y"])
-            if inside and capture:
+            if i == active:
                 tp["prog"] += 1.0 / CAPTURE_TICKS
                 self.capturing = True
                 if tp["prog"] >= 1.0:
                     tp["prog"] = 1.0
                     tp["done"] = True
                     self.score += 5
-                break  # solo se captura un templo a la vez
+            elif tp["prog"] > 0.0:
+                # Si se suelta X o se sale del rango, la barra baja sola.
+                # Solo queda permanente al completarse (done=True).
+                tp["prog"] = max(0.0, tp["prog"] - 1.0 / CAPTURE_TICKS)
+        self._prev_cap = bool(capture)
         if self.temples and all(t["done"] for t in self.temples):
             self.boss_explode = 120  # la piramide se destruye: explosion antes de ganar
             self.beams = []
@@ -634,15 +678,25 @@ class Game:
         t = L.tick
         c.delete("all")
         self._bg(c, t, level=L.level)
-        # lava animada en huecos del suelo
-        for x0 in (220, 490):
-            c.create_rectangle(x0, 578, x0 + 70, 600,
-                               fill="#ff5a3c", outline="")
-            c.create_rectangle(x0, 578, x0 + 70, 584,
-                               fill="#ffb35c", outline="")
-            for i in range(3):
-                bx = x0 + 12 + i * 22 + ((t // 3 + i * 7) % 5) - 2
-                c.create_oval(bx, 586, bx + 8, 592, fill="#ffd166", outline="")
+        # liquido en huecos del suelo: lava en nivel 2, agua en el resto
+        if L.level == 2:
+            for x0 in (220, 490):
+                c.create_rectangle(x0, 578, x0 + 70, 600,
+                                   fill="#ff5a3c", outline="")
+                c.create_rectangle(x0, 578, x0 + 70, 584,
+                                   fill="#ffb35c", outline="")
+                for i in range(3):
+                    bx = x0 + 12 + i * 22 + ((t // 3 + i * 7) % 5) - 2
+                    c.create_oval(bx, 586, bx + 8, 592, fill="#ffd166", outline="")
+        else:
+            for x0 in (220, 490):
+                c.create_rectangle(x0, 578, x0 + 70, 600,
+                                   fill="#2563eb", outline="")
+                c.create_rectangle(x0, 578, x0 + 70, 584,
+                                   fill="#7dd3fc", outline="")
+                for i in range(3):
+                    bx = x0 + 12 + i * 22 + ((t // 3 + i * 7) % 5) - 2
+                    c.create_oval(bx, 586, bx + 8, 592, fill="#dbeafe", outline="")
         # plataformas con pasto (hielo en p4 y p6)
         for i, (x, y, w, h) in enumerate(PLATFORMS):
             self._platform(c, x, y, w, h, ice=(i in ICE))
@@ -669,17 +723,12 @@ class Game:
                                  fill="#e4e4e7", outline="#71717a")
                 c.create_polygon(x0 + sw / 2 - 2, y + 6, x0 + sw / 2 + 2, y + 6, x0 + sw / 2, y,
                                  fill="#ef4444", outline="")
-        # meta: bandera ondeando (solo niveles 1-2; en nivel 3 se gana por templos)
+        # meta: solo bandera roja ondeando (solo niveles 1-2; en nivel 3 se gana por templos)
         if L.level in (1, 2):
-            c.create_rectangle(
-                500, 40, 650, 75, fill="#14532d", outline="#22c55e")
-            c.create_rectangle(505, 45, 645, 50, fill="#22c55e", outline="")
             c.create_rectangle(572, 30, 578, 75, fill="#d6d3d1", outline="")
             wave = ((t // 5) % 4) - 2
             c.create_polygon(578, 30, 620, 38 + wave, 578, 48,
-                             fill="#a6e3a1", outline="#4ade80")
-            c.create_text(575, 64, text="★ META ★", fill="#bbf7d0",
-                          font=("Arial", 10, "bold"))
+                             fill="#ef4444", outline="#991b1b")
         # monedas girando con brillo
         for i, (mxx, myy) in enumerate(L.coins):
             c.create_oval(mxx - 12, myy - 12, mxx + 12, myy +
@@ -690,12 +739,10 @@ class Game:
                           9, fill="#fde68a", outline="#b45309")
             c.create_text(mxx, myy, text="$", fill="#92400e",
                           font=("Arial", 9, "bold"))
-        # esfera del dragon del nivel (si aun no se agarro)
+        # esfera del dragon del nivel (si aun no se agarro): solo el icono flotando
         if getattr(L, "ball", None):
             self._dragon_ball(
                 c, L.ball["x"], L.ball["y"], L.ball["stars"], t, r=13)
-            c.create_text(L.ball["x"], L.ball["y"] - 24, text="★ ESFERA ★",
-                          fill="#fb923c", font=("Arial", 9, "bold"))
         # enemigos: slimes
         for e in L.enemies:
             self._enemy(c, e, t)
@@ -1249,7 +1296,7 @@ def selftest():
     L.step(False, False, False)
     assert L.on_ground, "colision suelo falla"
     L.step(False, False, True)
-    assert L.vy == JUMP, "salto falla"
+    assert L.vy == L.jump_v(), "salto falla"
     n = len(L.coins)
     L.px, L.py = COINS[0][0] - 13, COINS[0][1] - 18
     L.vy = 0
@@ -1292,7 +1339,7 @@ def selftest():
     assert abs(L4.py - py0) < 6, "ascensor no arrastra / teletransporta"
     # saltar desde el ascensor libera al jugador
     L4.step(False, False, True)
-    assert not L4.on_mover and L4.vy == JUMP, "salto desde ascensor falla"
+    assert not L4.on_mover and L4.vy == L4.jump_v(), "salto desde ascensor falla"
     # abordaje magnetico: aunque el ascensor suba, engancha al primer tick
     L10 = Logic()
     L10.tick = 0  # ascensor subiendo
